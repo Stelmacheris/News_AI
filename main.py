@@ -98,7 +98,8 @@ STOPWORDS = {
     "after", "over", "into", "amid", "how", "why", "what", "who", "will",
 }
 
-TRACKING_PARAMS = re.compile(r"^(utm_|fbclid|gclid|oc$|ved$|at_|ns_|ito$|ref$)")
+TRACKING_PARAMS = re.compile(
+    r"^(utm_|fbclid|gclid|oc$|ved$|at_|ns_|ito$|ref$)")
 
 
 # --------------------------------------------------------------------------
@@ -113,7 +114,8 @@ def canonical_url(url: str) -> str:
     """Strip tracking params and fragments so the same story dedupes cleanly."""
     try:
         p = urlparse(url)
-        q = [(k, v) for k, v in parse_qsl(p.query) if not TRACKING_PARAMS.match(k)]
+        q = [(k, v) for k, v in parse_qsl(p.query)
+             if not TRACKING_PARAMS.match(k)]
         return urlunparse((p.scheme, p.netloc.lower().removeprefix("www."),
                            p.path.rstrip("/"), "", urlencode(q), ""))
     except Exception:
@@ -381,7 +383,8 @@ def cluster(items: list[dict]) -> list[dict]:
         score += 3.0 * (len(sources) - 1)          # cross-outlet coverage
         score += min(points / 150.0, 3.0)          # HN votes, capped
         if lead["published"]:
-            age_h = (datetime.now(timezone.utc) - lead["published"]).total_seconds() / 3600
+            age_h = (datetime.now(timezone.utc) -
+                     lead["published"]).total_seconds() / 3600
             score += max(0.0, 2.0 - age_h / 4.0)   # mild recency bonus
 
         out.append({
@@ -417,14 +420,67 @@ Select the most consequential stories, up to the limit given. Prefer:
 Drop anything trivial, duplicated, or purely promotional. Returning fewer items
 than the limit is correct when the material is thin.
 
-Respond with ONLY a JSON array, no markdown fences and no commentary:
-[{"id": <int>, "headline": "<rewritten, max 90 chars>",
-  "summary": "<1-2 factual sentences, max 300 chars>",
-  "category": "world" | "ai" | "tech"}]
+Keep every summary to 1-2 sentences, under 300 characters. Never invent facts
+beyond what the snippet supports. If a snippet is too thin to summarise, write a
+summary that only restates the headline's claim. Never output URLs."""
 
-Never invent facts beyond what the snippet supports. If a snippet is too thin to
-summarise, write a summary that only restates the headline's claim. Never output
-URLs."""
+# Schema-enforced output. The model cannot emit prose, markdown fences, or
+# malformed JSON, which is what a plain "respond with JSON" instruction kept
+# producing. OpenRouter requires the schema root to be an object, hence the
+# "stories" wrapper.
+RESPONSE_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "digest",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "stories": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "integer"},
+                            "headline": {"type": "string"},
+                            "summary": {"type": "string"},
+                            "category": {"type": "string",
+                                         "enum": ["world", "ai", "tech"]},
+                        },
+                        "required": ["id", "headline", "summary", "category"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["stories"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def salvage_objects(text: str) -> list[dict]:
+    """
+    Pull every complete JSON object out of a possibly-truncated response.
+
+    If generation is cut off mid-object, json.loads fails on the whole payload
+    and nine good stories are lost along with the tenth partial one. Decoding
+    object-by-object keeps whatever finished.
+    """
+    decoder = json.JSONDecoder()
+    out, i = [], 0
+    while i < len(text):
+        start = text.find("{", i)
+        if start == -1:
+            break
+        try:
+            obj, end = decoder.raw_decode(text, start)
+            if isinstance(obj, dict):
+                out.append(obj)
+            i = end
+        except ValueError:
+            i = start + 1
+    return out
 
 
 def summarise(candidates: list[dict], api_key: str) -> list[dict] | None:
@@ -443,29 +499,62 @@ def summarise(candidates: list[dict], api_key: str) -> list[dict] | None:
                 f"Limit: {MAX_DIGEST_ITEMS} stories.\n\n{json.dumps(payload, ensure_ascii=False)}"},
         ],
         "temperature": 0.3,
-        "max_tokens": 2000,
+        # Generous ceiling: reasoning-capable models spend part of this budget
+        # on hidden thinking tokens before emitting any JSON, so a tight limit
+        # truncates the visible answer.
+        "max_tokens": 8000,
+        "response_format": RESPONSE_SCHEMA,
     }
 
     for attempt in range(3):
         try:
             resp = requests.post(
-                OPENROUTER_URL, timeout=120,
+                OPENROUTER_URL, timeout=180,
                 headers={"Authorization": f"Bearer {api_key}",
                          "Content-Type": "application/json",
                          "X-Title": "news-digest"},
                 json=body,
             )
-            resp.raise_for_status()
-            text = resp.json()["choices"][0]["message"]["content"]
-            text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
-            data = json.loads(text)
-            if isinstance(data, list) and data:
-                return data
-            log("LLM returned an empty list")
-            return []
+            if resp.status_code != 200:
+                log(f"LLM HTTP {resp.status_code}: {resp.text[:300]}")
+                resp.raise_for_status()
+
+            choice = resp.json()["choices"][0]
+            finish = choice.get("finish_reason")
+            text = (choice["message"].get("content") or "").strip()
+            usage = resp.json().get("usage", {})
+            log(f"LLM finish_reason={finish} chars={len(text)} usage={usage}")
+
+            if finish == "length":
+                log("  response hit the token ceiling - salvaging what completed")
+
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+
+            stories = None
+            try:
+                data = json.loads(text)
+                if isinstance(data, dict):
+                    stories = data.get("stories")
+                elif isinstance(data, list):
+                    stories = data
+            except json.JSONDecodeError:
+                salvaged = [o for o in salvage_objects(text) if "id" in o]
+                if salvaged:
+                    log(f"  recovered {len(salvaged)} complete objects from malformed JSON")
+                    stories = salvaged
+
+            if isinstance(stories, list) and stories:
+                return stories
+            if isinstance(stories, list):
+                log("LLM returned an empty list")
+                return []
+            log("  could not parse a story list from the response")
+            raise ValueError("unparseable response")
+
         except Exception as exc:
             log(f"LLM attempt {attempt + 1} failed: {type(exc).__name__}: {exc}")
-            time.sleep(3 * (attempt + 1))
+            if attempt < 2:
+                time.sleep(3 * (attempt + 1))
     return None
 
 
@@ -582,7 +671,8 @@ def main() -> int:
                      "category": c["category"]}
                     for c in candidates[:MAX_DIGEST_ITEMS]]
 
-    selected = [s for s in selected if isinstance(s, dict) and s.get("id") in by_id]
+    selected = [s for s in selected if isinstance(
+        s, dict) and s.get("id") in by_id]
     if not selected:
         log("model selected nothing worth sending")
         return 0
